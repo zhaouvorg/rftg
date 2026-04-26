@@ -23,8 +23,8 @@
 
 #include "rftg.h"
 #include "comm.h"
-#include <mysql/mysql.h>
 #include <pthread.h>
+#include <sqlite3.h>
 #include <unistd.h>
 
 /*
@@ -287,9 +287,14 @@ static char* server_name = NULL;
 static int debug_server = 0;
 
 /*
- * Connection to the database server.
+ * Connection to the SQLite database.
  */
-MYSQL *mysql;
+static sqlite3 *sqlite_db;
+
+/*
+ * Mutex protecting the shared SQLite connection.
+ */
+static pthread_mutex_t db_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /*
  * Log message to stdout.
@@ -324,6 +329,345 @@ static void server_log(char *format, ...)
 
 
 /*
+ * Stop the server after a database error.
+ */
+static void db_fatal(const char *context)
+{
+	server_log("%s: %s", context, sqlite3_errmsg(sqlite_db));
+	exit(1);
+}
+
+/*
+ * Prepare an SQLite statement or stop the server.
+ */
+static sqlite3_stmt *db_prepare(const char *sql)
+{
+	sqlite3_stmt *stmt = NULL;
+
+	if (sqlite3_prepare_v2(sqlite_db, sql, -1, &stmt, NULL) != SQLITE_OK)
+	{
+		db_fatal(sql);
+	}
+
+	return stmt;
+}
+
+/*
+ * Bind helpers for SQLite statements.
+ */
+static void db_bind_int(sqlite3_stmt *stmt, int index, int value)
+{
+	if (sqlite3_bind_int(stmt, index, value) != SQLITE_OK)
+	{
+		db_fatal("Could not bind integer");
+	}
+}
+
+static void db_bind_text(sqlite3_stmt *stmt, int index, const char *value)
+{
+	if (sqlite3_bind_text(stmt, index, value ? value : "", -1,
+	    SQLITE_TRANSIENT) != SQLITE_OK)
+	{
+		db_fatal("Could not bind text");
+	}
+}
+
+static void db_bind_blob(sqlite3_stmt *stmt, int index, const void *value,
+                         int size)
+{
+	if (sqlite3_bind_blob(stmt, index, value, size, SQLITE_TRANSIENT) !=
+	    SQLITE_OK)
+	{
+		db_fatal("Could not bind blob");
+	}
+}
+
+static void db_bind_null(sqlite3_stmt *stmt, int index)
+{
+	if (sqlite3_bind_null(stmt, index) != SQLITE_OK)
+	{
+		db_fatal("Could not bind null");
+	}
+}
+
+/*
+ * Step a statement that should not return rows.
+ */
+static void db_step_done(sqlite3_stmt *stmt, const char *context)
+{
+	int rc;
+
+	rc = sqlite3_step(stmt);
+	if (rc != SQLITE_DONE)
+	{
+		server_log("%s: %s", context, sqlite3_errmsg(sqlite_db));
+		sqlite3_finalize(stmt);
+		exit(1);
+	}
+
+	rc = sqlite3_finalize(stmt);
+	if (rc != SQLITE_OK)
+	{
+		db_fatal(context);
+	}
+}
+
+/*
+ * Step a statement that may return rows.
+ */
+static int db_step_row(sqlite3_stmt *stmt, const char *context)
+{
+	int rc;
+
+	rc = sqlite3_step(stmt);
+	if (rc == SQLITE_ROW) return 1;
+	if (rc == SQLITE_DONE) return 0;
+
+	server_log("%s: %s", context, sqlite3_errmsg(sqlite_db));
+	sqlite3_finalize(stmt);
+	exit(1);
+}
+
+/*
+ * Finish a statement that returned rows.
+ */
+static void db_finalize(sqlite3_stmt *stmt, const char *context)
+{
+	int rc;
+
+	rc = sqlite3_finalize(stmt);
+	if (rc != SQLITE_OK)
+	{
+		db_fatal(context);
+	}
+}
+
+/*
+ * Execute a schema statement.
+ */
+static void db_exec(const char *sql)
+{
+	char *err = NULL;
+
+	if (sqlite3_exec(sqlite_db, sql, NULL, NULL, &err) != SQLITE_OK)
+	{
+		server_log("%s: %s", sql, err ? err : sqlite3_errmsg(sqlite_db));
+		sqlite3_free(err);
+		exit(1);
+	}
+}
+
+/*
+ * Create any missing SQLite tables and indexes.
+ */
+static void db_init_schema(void)
+{
+	const char *schema[] =
+	{
+		"CREATE TABLE IF NOT EXISTS users("
+		"uid INTEGER PRIMARY KEY AUTOINCREMENT,"
+		"user TEXT NOT NULL,"
+		"pass TEXT NOT NULL)",
+		"CREATE INDEX IF NOT EXISTS users_user_idx ON users(user)",
+		"CREATE TABLE IF NOT EXISTS games("
+		"gid INTEGER PRIMARY KEY AUTOINCREMENT,"
+		"description TEXT NOT NULL,"
+		"pass TEXT NOT NULL,"
+		"created INTEGER NOT NULL,"
+		"state TEXT NOT NULL,"
+		"minp INTEGER NOT NULL,"
+		"maxp INTEGER NOT NULL,"
+		"exp INTEGER NOT NULL,"
+		"adv INTEGER NOT NULL,"
+		"dis_goal INTEGER NOT NULL,"
+		"dis_takeover INTEGER NOT NULL,"
+		"speed INTEGER NOT NULL,"
+		"version TEXT NOT NULL)",
+		"CREATE TABLE IF NOT EXISTS attendance("
+		"uid INTEGER NOT NULL,"
+		"gid INTEGER NOT NULL,"
+		"ai INTEGER NOT NULL DEFAULT 0,"
+		"seat INTEGER NOT NULL DEFAULT 0,"
+		"waiting TEXT)",
+		"CREATE INDEX IF NOT EXISTS attendance_gid_seat_idx "
+		"ON attendance(gid, seat)",
+		"CREATE TABLE IF NOT EXISTS results("
+		"gid INTEGER NOT NULL,"
+		"uid INTEGER NOT NULL,"
+		"vp INTEGER NOT NULL,"
+		"tie INTEGER NOT NULL,"
+		"winner INTEGER NOT NULL)",
+		"CREATE TABLE IF NOT EXISTS seed("
+		"gid INTEGER PRIMARY KEY,"
+		"pool BLOB NOT NULL)",
+		"CREATE TABLE IF NOT EXISTS choices("
+		"gid INTEGER NOT NULL,"
+		"uid INTEGER NOT NULL,"
+		"log BLOB NOT NULL,"
+		"PRIMARY KEY (gid, uid))",
+		"CREATE TABLE IF NOT EXISTS messages("
+		"mid INTEGER PRIMARY KEY AUTOINCREMENT,"
+		"gid INTEGER NOT NULL,"
+		"uid INTEGER NOT NULL,"
+		"message TEXT NOT NULL,"
+		"format TEXT NOT NULL DEFAULT '')",
+		NULL
+	};
+	int i;
+
+	for (i = 0; schema[i]; i++)
+	{
+		db_exec(schema[i]);
+	}
+}
+
+/*
+ * Open the SQLite database.
+ */
+static void db_open(const char *filename)
+{
+	if (sqlite3_open(filename, &sqlite_db) != SQLITE_OK)
+	{
+		server_log("Database connection: %s", sqlite3_errmsg(sqlite_db));
+		exit(1);
+	}
+
+	sqlite3_busy_timeout(sqlite_db, 5000);
+	db_init_schema();
+}
+
+/*
+ * Rotate a 32-bit word for SHA1.
+ */
+static uint32_t sha1_rotl(uint32_t value, int shift)
+{
+	return (value << shift) | (value >> (32 - shift));
+}
+
+/*
+ * Process one SHA1 block.
+ */
+static void sha1_process_block(const unsigned char block[64],
+                               uint32_t state[5])
+{
+	uint32_t w[80];
+	uint32_t a, b, c, d, e, f, k, temp;
+	int i;
+
+	for (i = 0; i < 16; i++)
+	{
+		w[i] = ((uint32_t)block[i * 4] << 24) |
+		       ((uint32_t)block[i * 4 + 1] << 16) |
+		       ((uint32_t)block[i * 4 + 2] << 8) |
+		       (uint32_t)block[i * 4 + 3];
+	}
+
+	for (i = 16; i < 80; i++)
+	{
+		w[i] = sha1_rotl(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^
+		                 w[i - 16], 1);
+	}
+
+	a = state[0];
+	b = state[1];
+	c = state[2];
+	d = state[3];
+	e = state[4];
+
+	for (i = 0; i < 80; i++)
+	{
+		if (i < 20)
+		{
+			f = (b & c) | ((~b) & d);
+			k = 0x5a827999;
+		}
+		else if (i < 40)
+		{
+			f = b ^ c ^ d;
+			k = 0x6ed9eba1;
+		}
+		else if (i < 60)
+		{
+			f = (b & c) | (b & d) | (c & d);
+			k = 0x8f1bbcdc;
+		}
+		else
+		{
+			f = b ^ c ^ d;
+			k = 0xca62c1d6;
+		}
+
+		temp = sha1_rotl(a, 5) + f + e + k + w[i];
+		e = d;
+		d = c;
+		c = sha1_rotl(b, 30);
+		b = a;
+		a = temp;
+	}
+
+	state[0] += a;
+	state[1] += b;
+	state[2] += c;
+	state[3] += d;
+	state[4] += e;
+}
+
+/*
+ * Create a lower-case SHA1 hex digest.
+ */
+static void sha1_hex(const unsigned char *data, size_t len, char out[41])
+{
+	uint32_t state[5];
+	unsigned char block[64];
+	uint64_t bit_len;
+	size_t pos, remain;
+	const char hex[] = "0123456789abcdef";
+	int i, j;
+
+	state[0] = 0x67452301;
+	state[1] = 0xefcdab89;
+	state[2] = 0x98badcfe;
+	state[3] = 0x10325476;
+	state[4] = 0xc3d2e1f0;
+	bit_len = (uint64_t)len * 8;
+	pos = 0;
+
+	while (len - pos >= 64)
+	{
+		sha1_process_block(data + pos, state);
+		pos += 64;
+	}
+
+	remain = len - pos;
+	memset(block, 0, sizeof(block));
+	memcpy(block, data + pos, remain);
+	block[remain] = 0x80;
+
+	if (remain >= 56)
+	{
+		sha1_process_block(block, state);
+		memset(block, 0, sizeof(block));
+	}
+
+	for (i = 0; i < 8; i++)
+	{
+		block[56 + i] = (unsigned char)(bit_len >> (56 - i * 8));
+	}
+
+	sha1_process_block(block, state);
+
+	for (i = 0; i < 5; i++)
+	{
+		for (j = 0; j < 8; j++)
+		{
+			out[i * 8 + j] =
+				hex[(state[i] >> (28 - j * 4)) & 0x0f];
+		}
+	}
+	out[40] = '\0';
+}
+
+/*
  * Check for a user in the database with the given password.
  *
  * If the user does not exist, create an entry for them.
@@ -332,92 +676,44 @@ static void server_log(char *format, ...)
  */
 static int db_user(char *user, char *pass)
 {
-	MYSQL_RES *res1, *res2;
-	MYSQL_ROW row1, row2;
-	char query[1024];
-	char euser[1024], epass[1024];
-	int uid;
+	sqlite3_stmt *stmt;
+	const char *stored;
+	char hash[41];
+	int uid = -1;
 
-	/* Escape user and password */
-	mysql_real_escape_string(mysql, euser, user, strlen(user));
-	mysql_real_escape_string(mysql, epass, pass, strlen(pass));
+	sha1_hex((unsigned char *)pass, strlen(pass), hash);
 
-	/* Create lookup query */
-	sprintf(query, "SELECT pass, uid FROM users WHERE user='%s'", euser);
+	pthread_mutex_lock(&db_mutex);
 
-	/* Run query */
-	mysql_query(mysql, query);
+	stmt = db_prepare("SELECT pass, uid FROM users WHERE user=? LIMIT 1");
+	db_bind_text(stmt, 1, user);
 
-	/* Fetch results */
-	res1 = mysql_store_result(mysql);
-
-	/* Check for no rows returned */
-	if (!(row1 = mysql_fetch_row(res1)))
+	if (db_step_row(stmt, "Could not look up user"))
 	{
-		/* Free old results */
-		mysql_free_result(res1);
+		stored = (const char *)sqlite3_column_text(stmt, 0);
 
-		/* Create insertion query */
-		sprintf(query, "INSERT INTO users (user, pass) VALUES \
-		        ('%s', SHA1('%s'))", euser, epass);
+		if (stored && !strcmp(stored, hash))
+		{
+			uid = sqlite3_column_int(stmt, 1);
+		}
 
-		/* Send query */
-		mysql_query(mysql, query);
-
-		/* Get ID of user inserted */
-		strcpy(query, "SELECT LAST_INSERT_ID()");
-
-		/* Run query */
-		mysql_query(mysql, query);
-
-		/* Fetch results */
-		res1 = mysql_store_result(mysql);
-
-		/* Get row */
-		row1 = mysql_fetch_row(res1);
-
-		/* Get user ID */
-		uid = strtol(row1[0], NULL, 0);
-
-		/* Free result */
-		mysql_free_result(res1);
-
-		/* Return ID */
+		db_finalize(stmt, "Could not finish user lookup");
+		pthread_mutex_unlock(&db_mutex);
 		return uid;
 	}
 
-	/* Create password hash query */
-	sprintf(query, "SELECT SHA1('%s')", epass);
+	db_finalize(stmt, "Could not finish user lookup");
 
-	/* Send query */
-	mysql_query(mysql, query);
+	stmt = db_prepare("INSERT INTO users (user, pass) VALUES (?, ?)");
+	db_bind_text(stmt, 1, user);
+	db_bind_text(stmt, 2, hash);
+	db_step_done(stmt, "Could not insert user");
 
-	/* Fetch results */
-	res2 = mysql_store_result(mysql);
+	uid = (int)sqlite3_last_insert_rowid(sqlite_db);
 
-	/* Get row */
-	row2 = mysql_fetch_row(res2);
+	pthread_mutex_unlock(&db_mutex);
 
-	/* Check for matching password */
-	if (!strcmp(row2[0], row1[0]))
-	{
-		/* Get ID */
-		uid = strtol(row1[1], NULL, 0);
-
-		/* Free results */
-		mysql_free_result(res1);
-		mysql_free_result(res2);
-
-		/* Return ID */
-		return uid;
-	}
-
-	/* Free results */
-	mysql_free_result(res1);
-	mysql_free_result(res2);
-
-	/* Bad password */
-	return -1;
+	return uid;
 }
 
 /*
@@ -425,27 +721,27 @@ static int db_user(char *user, char *pass)
  */
 static void db_user_name(int uid, char *name)
 {
-	MYSQL_RES *res;
-	MYSQL_ROW row;
-	char query[1024];
+	sqlite3_stmt *stmt;
+	const char *text;
 
-	/* Create query */
-	sprintf(query, "SELECT user FROM users WHERE uid=%d", uid);
+	pthread_mutex_lock(&db_mutex);
 
-	/* Run query */
-	mysql_query(mysql, query);
+	stmt = db_prepare("SELECT user FROM users WHERE uid=?");
+	db_bind_int(stmt, 1, uid);
 
-	/* Fetch results */
-	res = mysql_store_result(mysql);
+	if (db_step_row(stmt, "Could not look up user name"))
+	{
+		text = (const char *)sqlite3_column_text(stmt, 0);
+		strcpy(name, text ? text : "");
+	}
+	else
+	{
+		sprintf(name, "%d", uid);
+	}
 
-	/* Get row */
-	row = mysql_fetch_row(res);
+	db_finalize(stmt, "Could not finish user name lookup");
 
-	/* Copy user name */
-	strcpy(name, row[0]);
-
-	/* Free result */
-	mysql_free_result(res);
+	pthread_mutex_unlock(&db_mutex);
 }
 
 /*
@@ -455,59 +751,33 @@ static void db_user_name(int uid, char *name)
  */
 static int db_new_game(int sid)
 {
-	MYSQL_RES *res;
-	MYSQL_ROW row;
+	sqlite3_stmt *stmt;
 	session *s_ptr = &s_list[sid];
-	char query[1024];
-	char edesc[1024], epass[1024];
 	int gid;
 
-	/* Escape game description and password */
-	mysql_real_escape_string(mysql, edesc, s_ptr->desc,strlen(s_ptr->desc));
-	mysql_real_escape_string(mysql, epass, s_ptr->pass,strlen(s_ptr->pass));
+	pthread_mutex_lock(&db_mutex);
 
-	/* Create insertion query */
-	sprintf(query, "INSERT INTO games (description, pass, created, state, \
-	                                   minp, maxp, \
-	                                   exp, adv, dis_goal, dis_takeover, \
-	                                   speed, version) \
-	             VALUES ('%s', '%s', %d, 'WAITING', %d, %d, %d, %d, \
-	                     %d, %d, %d, '%s')",
-	        edesc, epass, s_ptr->created,
-	        s_ptr->min_player, s_ptr->max_player,
-	        s_ptr->expanded, s_ptr->advanced, s_ptr->disable_goal,
-	        s_ptr->disable_takeover, s_ptr->speed, VERSION);
+	stmt = db_prepare("INSERT INTO games "
+	                  "(description, pass, created, state, minp, maxp, "
+	                  "exp, adv, dis_goal, dis_takeover, speed, version) "
+	                  "VALUES (?, ?, ?, 'WAITING', ?, ?, ?, ?, ?, ?, ?, ?)");
+	db_bind_text(stmt, 1, s_ptr->desc);
+	db_bind_text(stmt, 2, s_ptr->pass);
+	db_bind_int(stmt, 3, s_ptr->created);
+	db_bind_int(stmt, 4, s_ptr->min_player);
+	db_bind_int(stmt, 5, s_ptr->max_player);
+	db_bind_int(stmt, 6, s_ptr->expanded);
+	db_bind_int(stmt, 7, s_ptr->advanced);
+	db_bind_int(stmt, 8, s_ptr->disable_goal);
+	db_bind_int(stmt, 9, s_ptr->disable_takeover);
+	db_bind_int(stmt, 10, s_ptr->speed);
+	db_bind_text(stmt, 11, VERSION);
+	db_step_done(stmt, "Could not insert game");
 
-	/* Send query */
-	mysql_query(mysql, query);
+	gid = (int)sqlite3_last_insert_rowid(sqlite_db);
 
-	/* Check for error */
-	if (*mysql_error(mysql))
-	{
-		/* Print error */
-		server_log("%s", mysql_error(mysql));
-		exit(1);
-	}
+	pthread_mutex_unlock(&db_mutex);
 
-	/* Get ID of game inserted */
-	strcpy(query, "SELECT LAST_INSERT_ID()");
-
-	/* Run query */
-	mysql_query(mysql, query);
-
-	/* Fetch results */
-	res = mysql_store_result(mysql);
-
-	/* Get row */
-	row = mysql_fetch_row(res);
-
-	/* Get ID */
-	gid = strtol(row[0], NULL, 0);
-
-	/* Free result */
-	mysql_free_result(res);
-
-	/* Return ID */
 	return gid;
 }
 
@@ -516,72 +786,61 @@ static int db_new_game(int sid)
  */
 static void db_load_sessions(void)
 {
-	MYSQL_RES *res;
-	MYSQL_ROW row;
+	sqlite3_stmt *stmt;
 	session *s_ptr;
+	const char *text;
 	int sid = 0;
 
-	/* Run query */
-	mysql_query(mysql, "SELECT gid, description, pass, created, state, \
-	                           minp, maxp, exp, adv, dis_goal, \
-	                           dis_takeover, speed \
-	                    FROM games \
-	                    WHERE state='WAITING' OR state='STARTED'");
+	pthread_mutex_lock(&db_mutex);
 
-	/* Fetch results */
-	res = mysql_store_result(mysql);
+	stmt = db_prepare("SELECT gid, description, pass, created, state, "
+	                  "minp, maxp, exp, adv, dis_goal, dis_takeover, speed "
+	                  "FROM games "
+	                  "WHERE state='WAITING' OR state='STARTED'");
 
-	/* Loop over rows returned */
-	while ((row = mysql_fetch_row(res)))
+	while (db_step_row(stmt, "Could not load sessions"))
 	{
-		/* Get pointer to session */
 		s_ptr = &s_list[sid];
 
-		/* Store sid */
 		s_ptr->sid = sid;
-
-		/* Initialize session mutex */
 		pthread_mutex_init(&s_ptr->session_mutex, NULL);
 
-		/* Read fields */
-		s_ptr->gid = strtol(row[0], NULL, 0);
-		strcpy(s_ptr->desc, row[1]);
-		strcpy(s_ptr->pass, row[2]);
-		s_ptr->created = strtol(row[3], NULL, 0);
+		s_ptr->gid = sqlite3_column_int(stmt, 0);
 
-		/* Check state */
-		if (!strcmp(row[4], "WAITING"))
+		text = (const char *)sqlite3_column_text(stmt, 1);
+		strcpy(s_ptr->desc, text ? text : "");
+
+		text = (const char *)sqlite3_column_text(stmt, 2);
+		strcpy(s_ptr->pass, text ? text : "");
+
+		s_ptr->created = sqlite3_column_int(stmt, 3);
+
+		text = (const char *)sqlite3_column_text(stmt, 4);
+		if (text && !strcmp(text, "WAITING"))
 		{
-			/* Set state */
 			s_ptr->state = SS_WAITING;
 		}
 		else
 		{
-			/* Game is started */
 			s_ptr->state = SS_STARTED;
 		}
 
-		/* Read fields */
-		s_ptr->min_player = strtol(row[5], NULL, 0);
-		s_ptr->max_player = strtol(row[6], NULL, 0);
-		s_ptr->expanded = strtol(row[7], NULL, 0);
-		s_ptr->advanced = strtol(row[8], NULL, 0);
-		s_ptr->disable_goal = strtol(row[9], NULL, 0);
-		s_ptr->disable_takeover = strtol(row[10], NULL, 0);
-		s_ptr->speed = strtol(row[11], NULL, 0);
+		s_ptr->min_player = sqlite3_column_int(stmt, 5);
+		s_ptr->max_player = sqlite3_column_int(stmt, 6);
+		s_ptr->expanded = sqlite3_column_int(stmt, 7);
+		s_ptr->advanced = sqlite3_column_int(stmt, 8);
+		s_ptr->disable_goal = sqlite3_column_int(stmt, 9);
+		s_ptr->disable_takeover = sqlite3_column_int(stmt, 10);
+		s_ptr->speed = sqlite3_column_int(stmt, 11);
 
-		/* Set last join time */
 		s_ptr->last_join = time(NULL);
-
-		/* Increase number of sessions */
 		num_session++;
-
-		/* Go to next session ID */
 		sid++;
 	}
 
-	/* Free results */
-	mysql_free_result(res);
+	db_finalize(stmt, "Could not finish loading sessions");
+
+	pthread_mutex_unlock(&db_mutex);
 }
 
 /*
@@ -589,68 +848,47 @@ static void db_load_sessions(void)
  */
 static void db_load_attendance(void)
 {
-	MYSQL_RES *res;
-	MYSQL_ROW row;
+	sqlite3_stmt *stmt;
 	session *s_ptr;
 	int uid, gid, ai;
 	int i;
 
-	/* Run query */
-	mysql_query(mysql, "SELECT uid, gid, ai \
-	                    FROM attendance \
-	                    JOIN games USING (gid) \
-	                    WHERE state='WAITING' OR state='STARTED' \
-	                    ORDER BY seat");
+	pthread_mutex_lock(&db_mutex);
 
-	/* Fetch results */
-	res = mysql_store_result(mysql);
+	stmt = db_prepare("SELECT attendance.uid, attendance.gid, attendance.ai "
+	                  "FROM attendance "
+	                  "JOIN games ON attendance.gid = games.gid "
+	                  "WHERE games.state='WAITING' OR games.state='STARTED' "
+	                  "ORDER BY attendance.seat");
 
-	/* Loop over rows returned */
-	while ((row = mysql_fetch_row(res)))
+	while (db_step_row(stmt, "Could not load attendance"))
 	{
-		/* Get user ID */
-		uid = strtol(row[0], NULL, 0);
+		uid = sqlite3_column_int(stmt, 0);
+		gid = sqlite3_column_int(stmt, 1);
+		ai = sqlite3_column_int(stmt, 2);
 
-		/* Get game ID */
-		gid = strtol(row[1], NULL, 0);
-
-		/* Get AI control */
-		ai = strtol(row[2], NULL, 0);
-
-		/* Loop over sessions */
 		for (i = 0; i < num_session; i++)
 		{
-			/* Stop at correct game ID */
 			if (s_list[i].gid == gid) break;
 		}
 
-		/* Check for error */
 		if (i == num_session)
 		{
-			/* Error */
 			server_log("Bad attendance: no gid %d", gid);
 			continue;
 		}
 
-		/* Get pointer to session */
 		s_ptr = &s_list[i];
-
-		/* Add user to session */
 		s_ptr->uids[s_ptr->num_users] = uid;
-
-		/* No connection for user yet */
 		s_ptr->cids[s_ptr->num_users] = -1;
-
-		/* Set AI control */
 		s_ptr->ai_control[s_ptr->num_users] = ai;
 		s_ptr->g.p[s_ptr->num_users].ai = ai;
-
-		/* Count users */
 		s_ptr->num_users++;
 	}
 
-	/* Free results */
-	mysql_free_result(res);
+	db_finalize(stmt, "Could not finish loading attendance");
+
+	pthread_mutex_unlock(&db_mutex);
 }
 
 /*
@@ -658,14 +896,16 @@ static void db_load_attendance(void)
  */
 static void db_join_game(int uid, int gid)
 {
-	char query[1024];
+	sqlite3_stmt *stmt;
 
-	/* Create query */
-	sprintf(query, "INSERT INTO attendance (uid, gid) VALUES (%d, %d)",
-	        uid, gid);
+	pthread_mutex_lock(&db_mutex);
 
-	/* Run query */
-	mysql_query(mysql, query);
+	stmt = db_prepare("INSERT INTO attendance (uid, gid) VALUES (?, ?)");
+	db_bind_int(stmt, 1, uid);
+	db_bind_int(stmt, 2, gid);
+	db_step_done(stmt, "Could not join game");
+
+	pthread_mutex_unlock(&db_mutex);
 }
 
 /*
@@ -673,14 +913,16 @@ static void db_join_game(int uid, int gid)
  */
 static void db_leave_game(int uid, int gid)
 {
-	char query[1024];
+	sqlite3_stmt *stmt;
 
-	/* Create query */
-	sprintf(query, "DELETE FROM attendance WHERE uid=%d AND gid=%d",
-	        uid, gid);
+	pthread_mutex_lock(&db_mutex);
 
-	/* Run query */
-	mysql_query(mysql, query);
+	stmt = db_prepare("DELETE FROM attendance WHERE uid=? AND gid=?");
+	db_bind_int(stmt, 1, uid);
+	db_bind_int(stmt, 2, gid);
+	db_step_done(stmt, "Could not leave game");
+
+	pthread_mutex_unlock(&db_mutex);
 }
 
 /*
@@ -690,78 +932,63 @@ static void db_leave_game(int uid, int gid)
  */
 static int db_load_game_state(int sid)
 {
-	MYSQL_RES *res;
-	MYSQL_ROW row;
+	sqlite3_stmt *stmt;
 	session *s_ptr = &s_list[sid];
-	unsigned long *field_len;
-	char query[1024];
+	const void *blob;
+	int size;
 	int i;
 
-	/* Create query */
-	sprintf(query, "SELECT pool FROM seed WHERE gid=%d", s_ptr->gid);
+	pthread_mutex_lock(&db_mutex);
 
-	/* Run query */
-	mysql_query(mysql, query);
+	stmt = db_prepare("SELECT pool FROM seed WHERE gid=?");
+	db_bind_int(stmt, 1, s_ptr->gid);
 
-	/* Fetch results */
-	res = mysql_store_result(mysql);
-
-	/* Check for no rows returned */
-	if (!res || !(row = mysql_fetch_row(res)))
+	if (!db_step_row(stmt, "Could not load random seed"))
 	{
-		/* Free result */
-		mysql_free_result(res);
-
-		/* No pool to load */
+		db_finalize(stmt, "Could not finish loading random seed");
+		pthread_mutex_unlock(&db_mutex);
 		return 0;
 	}
 
-	/* Copy returned data to random byte pool */
-	memcpy(s_ptr->random_pool, row[0], MAX_RAND);
-
-	/* Start at beginning of byte pool */
+	blob = sqlite3_column_blob(stmt, 0);
+	size = sqlite3_column_bytes(stmt, 0);
+	if (size > MAX_RAND) size = MAX_RAND;
+	memset(s_ptr->random_pool, 0, MAX_RAND);
+	if (blob && size > 0) memcpy(s_ptr->random_pool, blob, size);
 	s_ptr->random_pos = 0;
 
-	/* Free result */
-	mysql_free_result(res);
+	db_finalize(stmt, "Could not finish loading random seed");
 
-	/* Loop over players in session */
 	for (i = 0; i < s_ptr->num_users; i++)
 	{
-		/* Create query to load choice log */
-		sprintf(query,"SELECT log FROM choices WHERE gid=%d AND uid=%d",
-		        s_ptr->gid, s_ptr->uids[i]);
+		stmt = db_prepare("SELECT log FROM choices WHERE gid=? AND uid=?");
+		db_bind_int(stmt, 1, s_ptr->gid);
+		db_bind_int(stmt, 2, s_ptr->uids[i]);
 
-		/* Run query */
-		mysql_query(mysql, query);
-
-		/* Fetch results */
-		res = mysql_store_result(mysql);
-
-		/* Check for no rows returned */
-		if (!(row = mysql_fetch_row(res)))
+		if (!db_step_row(stmt, "Could not load choice log"))
 		{
-			/* Free result */
-			mysql_free_result(res);
-
-			/* Go to next player */
+			db_finalize(stmt, "Could not finish loading choice log");
 			continue;
 		}
 
-		/* Get length of log in bytes */
-		field_len = mysql_fetch_lengths(res);
+		blob = sqlite3_column_blob(stmt, 0);
+		size = sqlite3_column_bytes(stmt, 0);
+		if (size > (int)(sizeof(int) * CHOICE_LOG_LEN))
+		{
+			size = sizeof(int) * CHOICE_LOG_LEN;
+		}
 
-		/* Copy log */
-		memcpy(s_ptr->g.p[i].choice_log, row[0], field_len[0]);
+		if (blob && size > 0)
+		{
+			memcpy(s_ptr->g.p[i].choice_log, blob, size);
+		}
+		s_ptr->g.p[i].choice_size = size / sizeof(int);
 
-		/* Remember length */
-		s_ptr->g.p[i].choice_size = field_len[0] / sizeof(int);
-
-		/* Free result */
-		mysql_free_result(res);
+		db_finalize(stmt, "Could not finish loading choice log");
 	}
 
-	/* Success */
+	pthread_mutex_unlock(&db_mutex);
+
 	return 1;
 }
 
@@ -772,7 +999,8 @@ static int db_load_game_state(int sid)
 static void db_save_game_state(int sid)
 {
 	session *s_ptr = &s_list[sid];
-	char query[4096], pool[4096], *status = "";
+	sqlite3_stmt *stmt;
+	char *status = "";
 
 	/* Determine session status */
 	switch (s_ptr->state)
@@ -783,28 +1011,28 @@ static void db_save_game_state(int sid)
 		case SS_ABANDONED: status = "ABANDONED"; break;
 	}
 
-	/* Create query for session status */
-	sprintf(query, "UPDATE games SET state='%s' WHERE gid=%d", status,
-	        s_ptr->gid);
+	pthread_mutex_lock(&db_mutex);
 
-	/* Run query */
-	mysql_query(mysql, query);
+	stmt = db_prepare("UPDATE games SET state=? WHERE gid=?");
+	db_bind_text(stmt, 1, status);
+	db_bind_int(stmt, 2, s_ptr->gid);
+	db_step_done(stmt, "Could not save game status");
 
 	/* No need to save further data if game has not started or is finished */
 	if (s_ptr->state == SS_WAITING ||
 	    s_ptr->state == SS_ABANDONED ||
-	    s_ptr->state == SS_DONE) return;
+	    s_ptr->state == SS_DONE)
+	{
+		pthread_mutex_unlock(&db_mutex);
+		return;
+	}
 
-	/* Escape random byte pool */
-	mysql_real_escape_string(mysql, pool, (char *)s_ptr->random_pool,
-	                         MAX_RAND);
+	stmt = db_prepare("INSERT OR IGNORE INTO seed (gid, pool) VALUES (?, ?)");
+	db_bind_int(stmt, 1, s_ptr->gid);
+	db_bind_blob(stmt, 2, s_ptr->random_pool, MAX_RAND);
+	db_step_done(stmt, "Could not save random seed");
 
-	/* Create query to save random byte pool */
-	sprintf(query, "INSERT IGNORE INTO seed VALUES (%d, '%s')",
-	        s_ptr->gid, pool);
-
-	/* Run query */
-	mysql_query(mysql, query);
+	pthread_mutex_unlock(&db_mutex);
 }
 
 /*
@@ -813,20 +1041,23 @@ static void db_save_game_state(int sid)
 static void db_save_seats(int sid)
 {
 	session *s_ptr = &s_list[sid];
-	char query[1024];
+	sqlite3_stmt *stmt;
 	int i;
+
+	pthread_mutex_lock(&db_mutex);
 
 	/* Loop over players in game */
 	for (i = 0; i < s_ptr->num_users; i++)
 	{
-		/* Update seat number */
-		sprintf(query, "UPDATE attendance SET seat=%d \
-		                WHERE gid=%d AND uid=%d",
-		                i, s_ptr->gid, s_ptr->uids[i]);
-
-		/* Run query */
-		mysql_query(mysql, query);
+		stmt = db_prepare("UPDATE attendance SET seat=? "
+		                  "WHERE gid=? AND uid=?");
+		db_bind_int(stmt, 1, i);
+		db_bind_int(stmt, 2, s_ptr->gid);
+		db_bind_int(stmt, 3, s_ptr->uids[i]);
+		db_step_done(stmt, "Could not save seat");
 	}
+
+	pthread_mutex_unlock(&db_mutex);
 }
 
 /*
@@ -835,21 +1066,23 @@ static void db_save_seats(int sid)
 static void db_save_ai_control(int sid)
 {
 	session *s_ptr = &s_list[sid];
-	char query[1024];
+	sqlite3_stmt *stmt;
 	int i;
+
+	pthread_mutex_lock(&db_mutex);
 
 	/* Loop over players in game */
 	for (i = 0; i < s_ptr->num_users; i++)
 	{
-		/* Update seat number */
-		sprintf(query, "UPDATE attendance SET ai=%d \
-		                WHERE gid=%d AND uid=%d",
-		                s_ptr->ai_control[i], s_ptr->gid,
-		                s_ptr->uids[i]);
-
-		/* Run query */
-		mysql_query(mysql, query);
+		stmt = db_prepare("UPDATE attendance SET ai=? "
+		                  "WHERE gid=? AND uid=?");
+		db_bind_int(stmt, 1, s_ptr->ai_control[i]);
+		db_bind_int(stmt, 2, s_ptr->gid);
+		db_bind_int(stmt, 3, s_ptr->uids[i]);
+		db_step_done(stmt, "Could not save AI control");
 	}
+
+	pthread_mutex_unlock(&db_mutex);
 }
 
 /*
@@ -859,21 +1092,23 @@ static void db_save_choices(int sid, int who)
 {
 	session *s_ptr = &s_list[sid];
 	player *p_ptr;
-	char query[20000], log[20000];
+	sqlite3_stmt *stmt;
+	int size;
 
 	/* Get player pointer */
 	p_ptr = &s_ptr->g.p[who];
+	size = sizeof(int) * p_ptr->choice_size;
 
-	/* Escape choice log string */
-	mysql_real_escape_string(mysql, log, (char *)p_ptr->choice_log,
-	                         sizeof(int) * p_ptr->choice_size);
+	pthread_mutex_lock(&db_mutex);
 
-	/* Create query */
-	sprintf(query, "REPLACE INTO choices VALUES (%d, %d, '%s')", s_ptr->gid,
-	        s_ptr->uids[who], log);
+	stmt = db_prepare("INSERT OR REPLACE INTO choices (gid, uid, log) "
+	                  "VALUES (?, ?, ?)");
+	db_bind_int(stmt, 1, s_ptr->gid);
+	db_bind_int(stmt, 2, s_ptr->uids[who]);
+	db_bind_blob(stmt, 3, p_ptr->choice_log, size);
+	db_step_done(stmt, "Could not save choices");
 
-	/* Run query */
-	mysql_query(mysql, query);
+	pthread_mutex_unlock(&db_mutex);
 }
 
 /*
@@ -882,33 +1117,43 @@ static void db_save_choices(int sid, int who)
 static void db_save_waiting(int sid, int who)
 {
 	session *s_ptr = &s_list[sid];
-	char query[1024];
+	sqlite3_stmt *stmt;
 	char *state_str;
 
 	/* Check waiting status */
 	switch (s_ptr->waiting[who])
 	{
 		case WAIT_READY:
-			state_str = "'READY'";
+			state_str = "READY";
 			break;
 		case WAIT_BLOCKED:
-			state_str = "'BLOCKED'";
+			state_str = "BLOCKED";
 			break;
 		case WAIT_OPTION:
-			state_str = "'OPTION'";
+			state_str = "OPTION";
 			break;
 		default:
-			state_str = "NULL";
+			state_str = NULL;
 			break;
 	}
 
-	/* Update waiting status */
-	sprintf(query, "UPDATE attendance SET waiting=%s \
-	                WHERE gid=%d AND uid=%d",
-	               state_str, s_ptr->gid, s_ptr->uids[who]);
+	pthread_mutex_lock(&db_mutex);
 
-	/* Run query */
-	mysql_query(mysql, query);
+	stmt = db_prepare("UPDATE attendance SET waiting=? "
+	                  "WHERE gid=? AND uid=?");
+	if (state_str)
+	{
+		db_bind_text(stmt, 1, state_str);
+	}
+	else
+	{
+		db_bind_null(stmt, 1);
+	}
+	db_bind_int(stmt, 2, s_ptr->gid);
+	db_bind_int(stmt, 3, s_ptr->uids[who]);
+	db_step_done(stmt, "Could not save waiting state");
+
+	pthread_mutex_unlock(&db_mutex);
 }
 
 /*
@@ -916,48 +1161,52 @@ static void db_save_waiting(int sid, int who)
  */
 static void export_log(FILE *fff, int gid)
 {
-	MYSQL_RES *res;
-	MYSQL_ROW row;
-	char query[1024];
-	char name[1024];
+	sqlite3_stmt *stmt;
+	const char *message, *format, *user;
+	char name[1024], text[1024];
 
-	/* Create lookup query */
-	sprintf(query, "SELECT message, format, user "
-	               "FROM messages LEFT JOIN users USING (uid) "
-	               "WHERE gid=%d ORDER BY mid", gid);
+	pthread_mutex_lock(&db_mutex);
 
-	/* Run query */
-	mysql_query(mysql, query);
-
-	/* Fetch results */
-	res = mysql_store_result(mysql);
+	stmt = db_prepare("SELECT message, format, user "
+	                  "FROM messages LEFT JOIN users USING (uid) "
+	                  "WHERE gid=? ORDER BY mid");
+	db_bind_int(stmt, 1, gid);
 
 	/* Loop over rows returned */
-	while ((row = mysql_fetch_row(res)))
+	while (db_step_row(stmt, "Could not export log"))
 	{
+		message = (const char *)sqlite3_column_text(stmt, 0);
+		format = (const char *)sqlite3_column_text(stmt, 1);
+		user = (const char *)sqlite3_column_text(stmt, 2);
+		if (!message) message = "";
+		if (!format) format = "";
+
 		/* Check for chat message */
-		if (!strcmp(row[1], FORMAT_CHAT))
+		if (!strcmp(format, FORMAT_CHAT))
 		{
 			/* Write xml start tag with format attribute */
-			fprintf(fff, "    <Message format=\"%s\">", row[1]);
+			fprintf(fff, "    <Message format=\"%s\">", format);
 
 			/* Check for player chat */
-			if (row[2])
+			if (user)
 			{
 				/* Put user name */
-				fprintf(fff, "%s: ", xml_escape(row[2]));
+				fprintf(fff, "%s: ", xml_escape((char *)user));
 			}
 		}
 		else
 		{
 			/* Chop newline */
-			row[0][strlen(row[0]) - 1] = '\0';
+			strncpy(text, message, sizeof(text) - 1);
+			text[sizeof(text) - 1] = '\0';
+			if (strlen(text)) text[strlen(text) - 1] = '\0';
 
 			/* Check for private message */
-			if (row[2])
+			if (user)
 			{
 				/* Add user name */
-				sprintf(name, " private=\"%s\"", xml_escape(row[2]));
+				sprintf(name, " private=\"%s\"",
+				        xml_escape((char *)user));
 			}
 			else
 			{
@@ -966,7 +1215,7 @@ static void export_log(FILE *fff, int gid)
 			}
 
 			/* Check for no format */
-			if (!strlen(row[1]))
+			if (!strlen(format))
 			{
 				/* Write xml start tag */
 				fprintf(fff, "    <Message%s>", name);
@@ -976,16 +1225,20 @@ static void export_log(FILE *fff, int gid)
 			else
 			{
 				/* Write xml start tag with format attribute */
-				fprintf(fff, "    <Message format=\"%s\"%s>", row[1], name);
+				fprintf(fff, "    <Message format=\"%s\"%s>",
+				        format, name);
 			}
+
+			message = text;
 		}
 
 		/* Write message and xml end tag */
-		fprintf(fff, "%s</Message>\n", xml_escape(row[0]));
+		fprintf(fff, "%s</Message>\n", xml_escape((char *)message));
 	}
 
-	/* Free results */
-	mysql_free_result(res);
+	db_finalize(stmt, "Could not finish exporting log");
+
+	pthread_mutex_unlock(&db_mutex);
 }
 
 /*
@@ -996,7 +1249,8 @@ static void db_save_results(int sid)
 	session *s_ptr = &s_list[sid];
 	player *p_ptr;
 	int i, tie;
-	char query[1024], filename[1024];
+	sqlite3_stmt *stmt;
+	char filename[1024];
 
 	/* Save finished choice logs */
 	for (i = 0; i < s_ptr->num_users; i++)
@@ -1004,6 +1258,8 @@ static void db_save_results(int sid)
 		/* Save choice log for this player */
 		db_save_choices(sid, i);
 	}
+
+	pthread_mutex_lock(&db_mutex);
 
 	/* Loop over players */
 	for (i = 0; i < s_ptr->num_users; i++)
@@ -1015,14 +1271,18 @@ static void db_save_results(int sid)
 		tie = count_player_area(&s_ptr->g, i, WHERE_HAND) +
 		      count_player_area(&s_ptr->g, i, WHERE_GOOD);
 
-		/* Create query */
-		sprintf(query, "INSERT INTO results VALUES (%d, %d, %d, %d,%d)",
-		        s_ptr->gid, s_ptr->uids[i], p_ptr->end_vp, tie,
-		        p_ptr->winner);
-
-		/* Run query */
-		mysql_query(mysql, query);
+		stmt = db_prepare("INSERT INTO results "
+		                  "(gid, uid, vp, tie, winner) "
+		                  "VALUES (?, ?, ?, ?, ?)");
+		db_bind_int(stmt, 1, s_ptr->gid);
+		db_bind_int(stmt, 2, s_ptr->uids[i]);
+		db_bind_int(stmt, 3, p_ptr->end_vp);
+		db_bind_int(stmt, 4, tie);
+		db_bind_int(stmt, 5, p_ptr->winner);
+		db_step_done(stmt, "Could not save results");
 	}
+
+	pthread_mutex_unlock(&db_mutex);
 
 	/* Create file name */
 	sprintf(filename, "%s/Game_%06d.xml", export_folder, s_ptr->gid);
@@ -1046,31 +1306,22 @@ static void db_save_results(int sid)
  */
 static void db_save_message(int sid, int uid, char* txt, char* tag)
 {
-	char query[1024];
-	char etxt[1024], etag[1024];
+	sqlite3_stmt *stmt;
 
 	/* Do not save message if game is replaying */
 	if (s_list[sid].replaying) return;
 
-	/* Escape message and format */
-	mysql_real_escape_string(mysql, etxt, txt, strlen(txt));
-	mysql_real_escape_string(mysql, etag, tag, strlen(tag));
+	pthread_mutex_lock(&db_mutex);
 
-	/* Create insertion query */
-	sprintf(query, "INSERT INTO messages (gid, uid, message, format) \
-	                VALUES (%d, %d, '%s', '%s')",
-	        s_list[sid].gid, uid, etxt, etag);
+	stmt = db_prepare("INSERT INTO messages (gid, uid, message, format) "
+	                  "VALUES (?, ?, ?, ?)");
+	db_bind_int(stmt, 1, s_list[sid].gid);
+	db_bind_int(stmt, 2, uid);
+	db_bind_text(stmt, 3, txt);
+	db_bind_text(stmt, 4, tag);
+	db_step_done(stmt, "Could not save message");
 
-	/* Send query */
-	mysql_query(mysql, query);
-
-	/* Check for error */
-	if (*mysql_error(mysql))
-	{
-		/* Print error */
-		server_log("%s", mysql_error(mysql));
-		exit(1);
-	}
+	pthread_mutex_unlock(&db_mutex);
 }
 
 /*
@@ -1078,38 +1329,40 @@ static void db_save_message(int sid, int uid, char* txt, char* tag)
  */
 static void replay_messages(int gid, int cid)
 {
-	MYSQL_RES *res;
-	MYSQL_ROW row;
-	char query[1024];
+	sqlite3_stmt *stmt;
+	const char *message, *format, *user;
 	char msg[BUF_LEN], name[1024], *ptr;
 
-	/* Create lookup query */
-	sprintf(query, "SELECT message, format, user "
-	               "FROM messages LEFT JOIN users USING (uid) "
-	               "WHERE gid=%d AND (uid=%d OR uid=-1 OR format='%s') "
-	               "ORDER BY mid",
-	               gid, c_list[cid].uid, FORMAT_CHAT);
+	pthread_mutex_lock(&db_mutex);
 
-	/* Run query */
-	mysql_query(mysql, query);
-
-	/* Fetch results */
-	res = mysql_store_result(mysql);
+	stmt = db_prepare("SELECT message, format, user "
+	                  "FROM messages LEFT JOIN users USING (uid) "
+	                  "WHERE gid=? AND (uid=? OR uid=-1 OR format=?) "
+	                  "ORDER BY mid");
+	db_bind_int(stmt, 1, gid);
+	db_bind_int(stmt, 2, c_list[cid].uid);
+	db_bind_text(stmt, 3, FORMAT_CHAT);
 
 	/* Loop over rows returned */
-	while ((row = mysql_fetch_row(res)))
+	while (db_step_row(stmt, "Could not replay messages"))
 	{
+		message = (const char *)sqlite3_column_text(stmt, 0);
+		format = (const char *)sqlite3_column_text(stmt, 1);
+		user = (const char *)sqlite3_column_text(stmt, 2);
+		if (!message) message = "";
+		if (!format) format = "";
+
 		/* Reset message */
 		ptr = msg;
 
 		/* Check for no format */
-		if (!strlen(row[1]))
+		if (!strlen(format))
 		{
 			/* Create log message */
 			start_msg(&ptr, MSG_LOG);
 
 			/* Add text of message */
-			put_string(row[0], &ptr);
+			put_string((char *)message, &ptr);
 
 			/* Finish message */
 			finish_msg(msg, ptr);
@@ -1119,10 +1372,10 @@ static void replay_messages(int gid, int cid)
 		}
 
 		/* Check for chat message */
-		else if (!strcmp(row[1], FORMAT_CHAT))
+		else if (!strcmp(format, FORMAT_CHAT))
 		{
 			/* Check for global message */
-			if (!row[2])
+			if (!user)
 			{
 				/* Set empty user name */
 				strcpy(name, "");
@@ -1130,7 +1383,7 @@ static void replay_messages(int gid, int cid)
 			else
 			{
 				/* Copy user name */
-				strcpy(name, row[2]);
+				strcpy(name, user);
 			}
 
 			/* Create log message */
@@ -1140,7 +1393,7 @@ static void replay_messages(int gid, int cid)
 			put_string(name, &ptr);
 
 			/* Copy chat text to message */
-			put_string(row[0], &ptr);
+			put_string((char *)message, &ptr);
 
 			/* Finish message */
 			finish_msg(msg, ptr);
@@ -1156,10 +1409,10 @@ static void replay_messages(int gid, int cid)
 			start_msg(&ptr, MSG_LOG_FORMAT);
 
 			/* Add text of message */
-			put_string(row[0], &ptr);
+			put_string((char *)message, &ptr);
 
 			/* Add format of message */
-			put_string(row[1], &ptr);
+			put_string((char *)format, &ptr);
 
 			/* Finish message */
 			finish_msg(msg, ptr);
@@ -1169,8 +1422,9 @@ static void replay_messages(int gid, int cid)
 		}
 	}
 
-	/* Free results */
-	mysql_free_result(res);
+	db_finalize(stmt, "Could not finish replaying messages");
+
+	pthread_mutex_unlock(&db_mutex);
 }
 
 /*
@@ -4829,12 +5083,9 @@ int main(int argc, char *argv[])
 	fd_set readfds, writefds;
 	int listen_fd;
 	int i, n;
-	my_bool reconnect = 1;
 	time_t last_housekeep = 0;
 	int port = 16309;
-	char *db = "rftg";
-	char *db_user = "rftg";
-	char *db_pw = NULL, *db_host = NULL;
+	char *db = "rftg.sqlite";
 
 	/* Parse arguments */
 	for (i = 1; i < argc; i++)
@@ -4846,10 +5097,10 @@ int main(int argc, char *argv[])
 			printf("Race for the Galaxy server, version " RELEASE "\n\n");
 			printf("Arguments:\n");
 			printf("  -p     Port number to listen to. Default: 16309\n");
-			printf("  -host  MySQL database host. Default: \"localhost\"\n");
-			printf("  -d     MySQL database name. Default: \"rftg\"\n");
-			printf("  -u     MySQL database user. Default: \"rftg\"\n");
-			printf("  -pw    MySQL database password. Default: [none]\n");
+			printf("  -d     SQLite database file. Default: \"rftg.sqlite\"\n");
+			printf("  -host  Ignored; accepted for compatibility with old MySQL setup.\n");
+			printf("  -u     Ignored; accepted for compatibility with old MySQL setup.\n");
+			printf("  -pw    Ignored; accepted for compatibility with old MySQL setup.\n");
 			printf("  -t     Client timeout in seconds. 0 means do not kick players. Default: 60\n");
 			printf("  -k     Timeout to replace players with A.I. in ticks (%d seconds).\n", tick_size);
 			printf("            0 means do not replace players. Default: 30\n");
@@ -4874,29 +5125,29 @@ int main(int argc, char *argv[])
 		/* Check for database host */
 		if (!strcmp(argv[i], "-host"))
 		{
-			/* Set database host */
-			db_host = argv[++i];
+			/* Ignore old MySQL option */
+			i++;
 		}
 
 		/* Check for database name */
 		if (!strcmp(argv[i], "-d"))
 		{
-			/* Set database name */
+			/* Set database file */
 			db = argv[++i];
 		}
 
 		/* Check for database user */
 		if (!strcmp(argv[i], "-u"))
 		{
-			/* Set database user */
-			db_user = argv[++i];
+			/* Ignore old MySQL option */
+			i++;
 		}
 
 		/* Check for database password */
 		if (!strcmp(argv[i], "-pw"))
 		{
-			/* Set database password */
-			db_pw = argv[++i];
+			/* Ignore old MySQL option */
+			i++;
 		}
 
 		/* Check for timeout settings */
@@ -4957,27 +5208,8 @@ int main(int argc, char *argv[])
 		exit(1);
 	}
 
-	/* Initialize database library */
-	mysql = mysql_init(NULL);
-
-	/* Check for error */
-	if (!mysql)
-	{
-		/* Print error and exit */
-		server_log("Couldn't initialize database library!");
-		exit(1);
-	}
-
-	/* Attempt to connect to database server */
-	if (!mysql_real_connect(mysql, db_host, db_user, db_pw, db, 0, NULL, 0))
-	{
-		/* Print error and exit */
-		server_log("Database connection: %s", mysql_error(mysql));
-		exit(1);
-	}
-
-	/* Reconnect automatically when connection to database is lost */
-	mysql_options(mysql, MYSQL_OPT_RECONNECT, &reconnect);
+	/* Open database file and create any missing tables */
+	db_open(db);
 
 	/* Read game states from database */
 	db_load_sessions();

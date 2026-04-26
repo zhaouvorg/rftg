@@ -22,7 +22,7 @@ rftg_CFLAGS = -Wall @GTK_CFLAGS@ @GTK_MAC_CFLAGS@ -DRFTGDIR=\"$(pkgdatadir)\"
 rftg_LDADD = @GTK_LIBS@ @GTK_MAC_LIBS@
 
 rftgserver_CFLAGS = -Wall -DRFTGDIR=\"$(pkgdatadir)\" -DBINDIR=\"$(bindir)\"
-rftgserver_LDADD = -lmysqlclient -lpthread
+rftgserver_LDADD = -lsqlite3 -lpthread
 
 ai_client_CFLAGS = -Wall -DRFTGDIR=\"$(pkgdatadir)\"
 

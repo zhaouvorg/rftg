@@ -1,64 +1,58 @@
-# Keldon's RFTG MySQL tables (extracted from server.c)
-CREATE DATABASE rftg;
+-- Keldon's RFTG server tables for SQLite.
+-- The server creates these automatically when it opens the database file.
 
-USE rftg;
-
-CREATE USER 'rftg'@'localhost';
-
-GRANT SELECT,INSERT,UPDATE,DELETE ON rftg.* TO 'rftg'@'localhost';
-
-# All blob and text variables have max size 1024
-CREATE TABLE users(
- uid INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS users(
+ uid INTEGER PRIMARY KEY AUTOINCREMENT,
  user TEXT NOT NULL,
  pass TEXT NOT NULL);
 
-CREATE TABLE games(
- gid INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+CREATE INDEX IF NOT EXISTS users_user_idx ON users(user);
+
+CREATE TABLE IF NOT EXISTS games(
+ gid INTEGER PRIMARY KEY AUTOINCREMENT,
  description TEXT NOT NULL,
  pass TEXT NOT NULL,
- created INT NOT NULL,
- state ENUM('WAITING','STARTED','DONE','ABANDONED'),
- minp INT NOT NULL,
- maxp INT NOT NULL,
- exp INT NOT NULL,
- adv INT NOT NULL,
- dis_goal INT NOT NULL,
- dis_takeover INT NOT NULL,
- # variant INT NOT NULL, # Only used in version 0.8.1n
- speed INT NOT NULL,
+ created INTEGER NOT NULL,
+ state TEXT NOT NULL,
+ minp INTEGER NOT NULL,
+ maxp INTEGER NOT NULL,
+ exp INTEGER NOT NULL,
+ adv INTEGER NOT NULL,
+ dis_goal INTEGER NOT NULL,
+ dis_takeover INTEGER NOT NULL,
+ speed INTEGER NOT NULL,
  version TEXT NOT NULL);
 
-CREATE TABLE attendance(
- uid INT NOT NULL,
- gid INT NOT NULL,
- ai INT NOT NULL,
- seat INT NOT NULL,
- waiting ENUM('READY','BLOCKED','OPTION')); # From version 0.8.1m
+CREATE TABLE IF NOT EXISTS attendance(
+ uid INTEGER NOT NULL,
+ gid INTEGER NOT NULL,
+ ai INTEGER NOT NULL DEFAULT 0,
+ seat INTEGER NOT NULL DEFAULT 0,
+ waiting TEXT);
 
-# Note: the column names are not present in the code
-CREATE TABLE results(
- gid INT NOT NULL,
- uid INT NOT NULL,
- vp INT NOT NULL,
- tie INT NOT NULL,
- winner INT NOT NULL);
+CREATE INDEX IF NOT EXISTS attendance_gid_seat_idx
+ ON attendance(gid, seat);
 
-CREATE TABLE seed(
- gid INT NOT NULL,
+CREATE TABLE IF NOT EXISTS results(
+ gid INTEGER NOT NULL,
+ uid INTEGER NOT NULL,
+ vp INTEGER NOT NULL,
+ tie INTEGER NOT NULL,
+ winner INTEGER NOT NULL);
+
+CREATE TABLE IF NOT EXISTS seed(
+ gid INTEGER PRIMARY KEY,
  pool BLOB NOT NULL);
 
-# Exception: log is max length 20000
-CREATE TABLE choices(
- gid INT NOT NULL,
- uid INT NOT NULL,
+CREATE TABLE IF NOT EXISTS choices(
+ gid INTEGER NOT NULL,
+ uid INTEGER NOT NULL,
  log BLOB NOT NULL,
  PRIMARY KEY (gid, uid));
- 
-# This table is only used from version 0.8.1k
-CREATE TABLE messages(
- mid INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
- gid INT NOT NULL,
- uid INT NOT NULL,
+
+CREATE TABLE IF NOT EXISTS messages(
+ mid INTEGER PRIMARY KEY AUTOINCREMENT,
+ gid INTEGER NOT NULL,
+ uid INTEGER NOT NULL,
  message TEXT NOT NULL,
- format CHAR(16) NOT NULL);
+ format TEXT NOT NULL DEFAULT '');

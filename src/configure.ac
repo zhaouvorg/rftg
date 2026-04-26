@@ -42,9 +42,12 @@ AC_ARG_ENABLE([server], [AS_HELP_STRING([--enable-server],
 		[enable multiplayer server])], [], [enable_server=no])
 
 AS_IF([test "x$enable_server" != xno],
-	[AC_CHECK_LIB([mysqlclient], [mysql_init], true,
+	[AC_CHECK_HEADERS([sqlite3.h], [],
 	[AC_MSG_FAILURE(
-	 [--enable-server was given, but test for mysqlclient failed])])])
+	 [--enable-server was given, but sqlite3.h was not found])])
+	AC_CHECK_LIB([sqlite3], [sqlite3_open], true,
+	[AC_MSG_FAILURE(
+	 [--enable-server was given, but test for sqlite3 failed])])])
 
 AM_CONDITIONAL(BUILD_SERVER, test "x$enable_server" != xno)
 
