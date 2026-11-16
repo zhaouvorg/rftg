@@ -52,6 +52,21 @@ test('public state hides opponent hands and keeps current public tableau',()=>{
 test('metadata refresh from another player reconnect preserves outstanding choice',()=>{
   const s=sample(),q=s.choice;applyMessage(s,{type:40,data:{numPlayers:2,expansion:0,names:['test','other'],ai:[0,0],goals:Array(20).fill(0),mode:0}},catalog);assert.equal(s.choice,q);
 });
+test('misc status decodes legacy and current action slot widths',()=>{
+  const s=sample();
+  for(const version of ['0.9.4','0.9.6']){
+    s.version=version;applyMessage(s,{type:MSG.STATUS_MISC,data:{values:[1,7,0,0,1,0,0,0,0,0,0,0,3]}},catalog);
+    assert.deepEqual(s.actions,[0,0,1,0,0,0,0,0,0,0]);assert.equal(s.currentAction,3);
+  }
+  s.version='1.2.1';applyMessage(s,{type:MSG.STATUS_MISC,data:{values:[2,8,0,0,0,1,0,0,0,0,0,0,0,5]}},catalog);
+  assert.deepEqual(s.actions,[0,0,0,1,0,0,0,0,0,0,0]);assert.equal(s.currentAction,5);
+});
+test('develop payment discount uses the decoded current action',()=>{
+  const s=sample({type:6,args:[0,0,0]}),cards=[definition(0,'Three-cost development',2,3)];
+  s.version='0.9.4';s.cards=s.cards.slice(0,1);
+  applyMessage(s,{type:MSG.STATUS_MISC,data:{values:[1,7,0,0,1,0,0,0,0,0,0,0,3]}},cards);
+  assert.equal(paymentNeeded(s,cards,0),2);
+});
 test('start selection rejects duplicated discards and forged worlds',()=>{
   const s=sample({type:1,list:[0,1,5,6],special:[2,3]});
   const r=makeAnswer(s,definitions,{list:[0,1],special:[2]});assert.equal(validateChoice(s,r,definitions),null);

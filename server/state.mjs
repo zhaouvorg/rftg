@@ -2,6 +2,10 @@ import { MSG } from '../shared/constants.mjs';
 import { buildDeckDesigns } from '../shared/deck.mjs';
 import { unpackOrb,unpackXcs,unpackInvasion } from '../shared/snapshots.mjs';
 
+function actionStatusCount(version) {
+  return version && !version.startsWith('0.') ? 11 : 10;
+}
+
 export function newState(user='') {
   return {user,status:'connecting',version:'',roomId:null,rooms:{},users:{},meta:null,seat:0,
     players:[],cards:[],round:0,vpPool:0,actions:[],currentAction:-2,goals:[],waiting:[],
@@ -47,8 +51,9 @@ export function applyMessage(s,{type,data:d},catalog) {
     }
     case MSG.STATUS_GOAL: for(let i=0;i<20;i++)Object.assign(s.goals[i]??={}, {available:v[i*2],most:v[i*2+1]});break;
     case MSG.STATUS_MISC: {
-      s.round=v[0];s.vpPool=v[1];s.actions=v.slice(2,13);s.currentAction=v[13];
-      if(v.length>14 && v[15]>=13)s.invasion=unpackInvasion(v.slice(16,16+v[15]));break;
+      const currentIndex=2+actionStatusCount(s.version),invasionIndex=currentIndex+1;
+      s.round=v[0];s.vpPool=v[1];s.actions=v.slice(2,currentIndex);s.currentAction=v[currentIndex];
+      if(v.length>invasionIndex+1 && v[invasionIndex+1]>=13)s.invasion=unpackInvasion(v.slice(invasionIndex+2,invasionIndex+2+v[invasionIndex+1]));break;
     }
     case MSG.STATUS_ORB: s.orb=unpackOrb(v);break;
     case MSG.STATUS_XCS: s.xcs=unpackXcs(v);break;
