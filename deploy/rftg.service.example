@@ -1,0 +1,25 @@
+# Copy to /etc/systemd/system/rftg.service after editing.
+# Layout: /srv/RFTG/ and /srv/rftg-mobile/ are sibling directories.
+# Replace /srv with their actual parent directory and User with an existing
+# non-root deployment account. The server runs in the foreground.
+# Keep the working directory at RFTG/src for ai_client, cards.txt and network/.
+# The account needs write access to the SQLite database and its parent directory;
+# game XML exports also go into RFTG/src by default.
+[Unit]
+Description=RFTG native game server
+After=network.target
+
+[Service]
+Type=exec
+User=rftg
+WorkingDirectory=/srv/RFTG/src
+ExecStart=/srv/RFTG/src/rftgserver -p 16309 -d /srv/RFTG/src/rftg.sqlite
+Restart=on-failure
+RestartSec=3
+# Stop the server and every ai_client child together.
+KillMode=control-group
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

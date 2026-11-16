@@ -1,41 +1,5 @@
-# Object files
-*.o
-*.ko
-*.obj
-*.elf
-
-# Precompiled Headers
-*.gch
-*.pch
-
-# Libraries
-*.lib
-*.a
-*.la
-*.lo
-
-# Shared objects (inc. Windows DLLs)
-*.so
-*.so.*
-*.dylib
-
-# Executables
-*.exe
-*.out
-*.app
-*.i*86
-*.x86_64
-*.hex
-
-# Visual studio files
-.vs
-*.*sdf
-*.vcxproj.user
-*.VC.opendb
-*.VC.db
-*.aps
-
-# Build files
-Debug
-Release
-Learner
+node_modules/
+.env
+test-results/
+*.log
+dist/

@@ -1,0 +1,27 @@
+# Optional static origin behind the CDN; include inside http {}.
+# Replace domains, certificate paths, and root with actual deployment values.
+server {
+    listen 443 ssl;
+    server_name rftgm.a.com;
+    ssl_certificate /etc/letsencrypt/live/rftgm.a.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/rftgm.a.com/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    root /srv/rftg-mobile/dist/static;
+    index index.html;
+    include /etc/nginx/mime.types;
+    types { text/javascript mjs; }
+    default_type application/octet-stream;
+
+    add_header X-Content-Type-Options nosniff always;
+    add_header Referrer-Policy same-origin always;
+    add_header X-Frame-Options DENY always;
+    # The build also embeds this connect policy in HTML for other CDN hosts.
+    add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https://rftg.a.com wss://rftg.a.com; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'" always;
+    expires -1;
+
+    location = /client-config.json { expires -1; try_files $uri =404; }
+    location /assets/ { expires 1d; try_files $uri =404; }
+    location ~ /\. { deny all; }
+    # There is no API or WebSocket proxy on the static hostname.
+    location / { try_files $uri $uri/ =404; }
+}

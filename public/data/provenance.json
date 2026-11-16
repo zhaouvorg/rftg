@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "source": "../rftgp",
+  "files": {
+    "src/cards.txt": "9ef303ac8b2a2dc955fbc5cce76e704dbfe8454a47ce86cb7d5c789806027eed",
+    "src/images.data": "8cfa6898dc9667fd2bfefc6a4febb0064e649e383f631c756f13f6f0f3fe3b97",
+    "src/init.c": "3ed5a042b837b876060d059d2ff52430cefa0f2e5c5412aa32451997a5dd9c3b",
+    "src/rftg.h": "21901b94c49c49190c0978704cf3558b04c456df35ada7dd76ca7a9aa782391b"
+  },
+  "cardCount": 364,
+  "bundleImages": 419,
+  "expansionAssets": 114,
+  "deckOrder": "Card designs in cards.txt order; each design repeated by its cumulative expansion count. Promo cards omitted unless explicitly enabled. XCS side-deck designs materialize from MSG_STATUS_CARD design_index.",
+  "artwork": "Race for the Galaxy card and other artwork: Rio Grande Games. Game design: Tom Lehmann. Existing artwork retains its original copyright; see ASSET_LICENSES.md."
+}

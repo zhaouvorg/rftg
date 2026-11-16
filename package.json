@@ -1,0 +1,31 @@
+{
+  "name": "rftg-mobile",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "HTML5 Race for the Galaxy client with a native-protocol Node gateway",
+  "license": "GPL-2.0-or-later",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node server/index.mjs",
+    "dev": "node --watch server/index.mjs",
+    "assets": "node scripts/import-assets.mjs",
+    "check": "node scripts/verify-assets.mjs && node --check server/index.mjs && node --check public/app.mjs",
+    "test": "node --test tests/unit.test.mjs tests/configuration.test.mjs",
+    "test:integration": "node --test tests/integration.test.mjs",
+    "test:browser": "node --test tests/browser.test.mjs",
+    "test:all": "npm test && npm run test:integration && npm run test:browser && npm run test:consistency && npm run test:deployment",
+    "test:consistency": "node scripts/compare-mobile.mjs",
+    "build:static": "node scripts/build-static.mjs",
+    "preview:static": "node scripts/serve-static.mjs",
+    "test:deployment": "node --test tests/deployment.test.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "playwright-core": "^1.56.0"
+  }
+}

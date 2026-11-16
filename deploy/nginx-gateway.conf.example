@@ -1,0 +1,61 @@
+# Include inside nginx's http {}. a.com is only a placeholder.
+# Node listens only on loopback; this vhost has no static root/alias.
+map $http_upgrade $rftg_connection_upgrade {
+    default upgrade;
+    '' close;
+}
+
+server {
+    listen 80;
+    server_name rftg.a.com;
+    location = /ws { return 301 https://rftg.a.com$request_uri; }
+    location = /api/config { return 301 https://rftg.a.com$request_uri; }
+    location = /healthz { return 301 https://rftg.a.com$request_uri; }
+    location ^~ /api/ { return 404; }
+    location / { return 301 https://rftgm.a.com$request_uri; }
+}
+
+server {
+    listen 443 ssl;
+    server_name rftg.a.com;
+    ssl_certificate /etc/letsencrypt/live/rftg.a.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/rftg.a.com/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_cache off;
+
+    location = /ws {
+        proxy_pass http://127.0.0.1:30001;
+        # Repeat headers here: a proxy_set_header in a location replaces
+        # the inherited proxy_set_header list on older nginx versions.
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $rftg_connection_upgrade;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_buffering off;
+    }
+    location = /api/config {
+        proxy_pass http://127.0.0.1:30001;
+    }
+    location = /healthz {
+        proxy_pass http://127.0.0.1:30001;
+    }
+    location ^~ /api/ {
+        return 404;
+    }
+
+    # Never serve/proxy HTML, modules, shared code, images or fonts here.
+    # Keep the path and query string; the browser moves to the CDN entry.
+    location / {
+        return 301 https://rftgm.a.com$request_uri;
+    }
+}

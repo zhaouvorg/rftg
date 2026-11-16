@@ -1,0 +1,24 @@
+# Copy to /etc/systemd/system/rftg-mobile.service after editing.
+# Layout: /srv/RFTG/ and /srv/rftg-mobile/ are sibling directories.
+# Replace User with an existing non-root deployment account.
+# Replace both /srv/rftg-mobile paths with the full project directory.
+# Replace /usr/bin/node with the absolute path from: command -v node
+# Node must be version 22 or newer. No shell profile is loaded by systemd.
+# The application loads /srv/rftg-mobile/.env itself.
+[Unit]
+Description=RFTG Mobile Node gateway
+After=network.target
+
+[Service]
+Type=exec
+User=rftg
+WorkingDirectory=/srv/rftg-mobile
+Environment=NODE_ENV=production
+ExecStart=/usr/bin/node /srv/rftg-mobile/server/index.mjs
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=20
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target
