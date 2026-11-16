@@ -3101,7 +3101,7 @@
         "RemovePreviousVersions" = "11:TRUE"
         "DetectNewerInstalledVersion" = "11:TRUE"
         "InstallAllUsers" = "11:FALSE"
-        "ProductVersion" = "8:0.9.5"
+        "ProductVersion" = "8:0.9.4"
         "Manufacturer" = "8:B. Nordli"
         "ARPHELPTELEPHONE" = "8:"
         "ARPHELPLINK" = "8:"
