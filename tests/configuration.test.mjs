@@ -1,20 +1,33 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
-import { normalizeConfiguration,changeConfiguration } from '../shared/configuration.mjs';
-import { root } from './helpers.mjs';
-import path from 'node:path';
+import { PUBLIC_EXPANSIONS,GAME_OPTIONS,normalizeConfiguration,changeConfiguration,configurationRequest } from '../shared/configuration.mjs';
 
-test('new-game checkboxes match actual PC local and online callbacks for 10100 transitions',()=>{
-  const source=process.env.RFTG_SOURCE?path.resolve(process.env.RFTG_SOURCE,'..'):path.resolve(root,'../rftgp');
-  const result=JSON.parse(execFileSync('python3',['tests/native/create-oracle.py','--source',source,'--trials','100','--steps','100'],{cwd:root,maxBuffer:40*1024*1024}));
-  let c;
-  for(const [i,step] of result.trace.entries()){
-    c=step.action?changeConfiguration(c,step.action.key,step.action.value):normalizeConfiguration();
-    for(const key of ['local','online']){
-      const {disabledExpansions,...expected}=step[key];
-      assert.deepEqual(Object.fromEntries(Object.keys(expected).map(k=>[k,c[k]])),expected,`${key} at ${i}: ${JSON.stringify(step.action)}`);
-      assert.deepEqual(c.counterstrike?[5]:[],disabledExpansions);
-    }
+test('create dialog exposes only the base game and Arc 1 expansions',()=>{
+  assert.deepEqual(PUBLIC_EXPANSIONS,[0,1,2,3]);
+  assert.deepEqual(GAME_OPTIONS.map(([key])=>key),['advanced','disableGoals','disableTakeovers']);
+  const c=normalizeConfiguration();
+  assert.deepEqual(c.selected,[0]);assert.equal(c.expansion,0);assert.equal(c.mode,0);
+});
+test('Alien Artifacts and Xeno creation inputs are ignored',()=>{
+  const c=normalizeConfiguration({selected:[4,5,7,8],orb:true,invasion:true,frontier:true,counterstrike:true});
+  assert.deepEqual(c.selected,[0]);assert.equal(c.expansion,0);assert.equal(c.mode,0);
+  for(const key of ['orb','invasion','frontier','counterstrike'])assert.equal(c[key],undefined);
+  for(const id of [4,5,7,8]){
+    const next=changeConfiguration(c,'expansion',id);
+    assert.deepEqual(next.selected,[0]);assert.equal(next.expansion,0);assert.equal(next.mode,0);
   }
+  for(const key of ['orb','invasion','frontier','counterstrike']){
+    const next=changeConfiguration(c,key,true);
+    assert.equal(next[key],undefined);assert.equal(next.mode,0);
+  }
+  assert.deepEqual(configurationRequest(c),{expansion:0,mode:0,arc1Mask:0,minPlayers:2,maxPlayers:2,advanced:false,disableGoals:false,disableTakeovers:false});
+});
+test('Arc 1 selections still combine and enable their restrictions',()=>{
+  let c=normalizeConfiguration();
+  for(const id of [1,2,3])c=changeConfiguration(c,'expansion',id);
+  assert.deepEqual(c.selected,[1,2,3]);assert.equal(c.expansion,3);assert.equal(c.arc1Mask,7);
+  c=changeConfiguration(c,'disableGoals',true);c=changeConfiguration(c,'disableTakeovers',true);
+  assert.equal(c.disableGoals,true);assert.equal(c.disableTakeovers,true);
+  c=changeConfiguration(c,'expansion',0);
+  assert.deepEqual(c.selected,[0]);assert.equal(c.arc1Mask,0);assert.equal(c.disableGoals,false);assert.equal(c.disableTakeovers,false);
 });

@@ -66,31 +66,23 @@ test('headless mobile browser: login, room, real game, reconnect and result', {t
   t.diagnostic(`Headless Chromium completed ${turns} real UI choices; screenshots saved in test-results/.`);
 });
 
-test('headless create dialog exposes the same checkbox list and state as PC callbacks', {timeout:40000}, async t=>{
-  const {execFileSync}=await import('node:child_process');
-  const source=process.env.RFTG_SOURCE?path.resolve(process.env.RFTG_SOURCE,'..'):path.resolve(root,'../rftgp');
-  const native=JSON.parse(execFileSync('python3',['tests/native/create-oracle.py','--source',source,'--trials','1','--steps','80'],{cwd:root,maxBuffer:2e6}));
+test('headless create dialog exposes only base and Arc 1 options', {timeout:40000}, async t=>{
   const f=await fixture();t.after(()=>f.close());
   const browser=await chromium.launch({headless:true,executablePath:process.env.CHROME_BIN||'/usr/bin/google-chrome',args:['--no-sandbox']});t.after(()=>browser.close());
   const page=await browser.newPage({viewport:{width:320,height:800}});
   await page.goto(f.url);await page.getByLabel('玩家名称').fill('config_checker');await page.getByLabel('密码',{exact:true}).fill('testpw');
   await page.getByRole('button',{name:'连接银河'}).click();await page.getByRole('button',{name:'创建游戏',exact:false}).click();
-  for(const row of native.trace){
-    if(row.action){
-      const {key,value}=row.action;
-      const input=page.locator(`[data-config="${key}"]${['players','expansion'].includes(key)?`[value="${value}"]`:''}`);
-      if(await input.isEnabled()){
-        if(key==='expansion')await input.click();else if(key==='players')await input.check();else await input.setChecked(value);
-      }
-    }
-    const dom=await page.locator('#create-controls').evaluate(el=>{
-      const expansions=[...el.querySelectorAll('[data-config="expansion"]')],options=[...el.querySelectorAll('input[type="checkbox"]')].filter(e=>e.dataset.config!=='expansion');
-      return {order:expansions.map(e=>+e.value),selected:expansions.filter(e=>e.checked).map(e=>+e.value),players:+el.querySelector('[data-config="players"]:checked').value,disabledExpansions:expansions.filter(e=>e.disabled).map(e=>+e.value),checked:Object.fromEntries(options.map(e=>[e.dataset.config,e.checked])),enabled:Object.fromEntries(options.map(e=>[e.dataset.config,!e.disabled]))};
-    });
-    assert.deepEqual(dom.order,[0,1,2,3,4,5,8]);
-    for(const key of ['selected','players','disabledExpansions','enabled'])assert.deepEqual(dom[key],row.local[key],`${key}: ${JSON.stringify(row.action)}`);
-    for(const [key,checked]of Object.entries(dom.checked))assert.equal(checked,row.local[key]);
-  }
+  const dom=await page.locator('#create-controls').evaluate(el=>({
+    expansions:[...el.querySelectorAll('[data-config="expansion"]')].map(e=>+e.value),
+    options:[...el.querySelectorAll('input[type="checkbox"]')].filter(e=>e.dataset.config!=='expansion').map(e=>e.dataset.config),
+  }));
+  assert.deepEqual(dom.expansions,[0,1,2,3]);
+  assert.deepEqual(dom.options,['advanced','disableGoals','disableTakeovers']);
+  for(const id of [4,5,7,8])assert.equal(await page.locator(`[data-config="expansion"][value="${id}"]`).count(),0);
+  for(const key of ['orb','invasion','frontier','counterstrike'])assert.equal(await page.locator(`[data-config="${key}"]`).count(),0);
+  await page.locator('[data-config="expansion"][value="2"]').check();await page.locator('[data-config="expansion"][value="3"]').check();
+  const selected=await page.locator('[data-config="expansion"]:checked').evaluateAll(es=>es.map(e=>+e.value));
+  assert.deepEqual(selected,[2,3]);
   assert.equal(await page.locator('#create-form select').count(),0);
   assert.equal(await page.locator('#modal').evaluate(e=>e.scrollWidth<=e.clientWidth),true);
 });
@@ -122,77 +114,6 @@ test('headless advanced phase bar uses seven PC role icons at the top', {timeout
   }
   await page.setViewportSize({width:390,height:844});
   await page.screenshot({path:path.join(root,'test-results/advanced-phases-top-mobile.png')});
-});
-
-test('headless Orb map renders pieces and accepts direct map clicks', {timeout:90000}, async t=>{
-  const f=await fixture(17);t.after(()=>f.close());
-  const browser=await chromium.launch({headless:true,executablePath:process.env.CHROME_BIN||'/usr/bin/google-chrome',args:['--no-sandbox']});t.after(()=>browser.close());
-  const page=await browser.newPage({viewport:{width:390,height:844}});
-  await page.addInitScript(()=>{const Native=window.WebSocket;window.WebSocket=class extends Native{constructor(...args){super(...args);this.addEventListener('message',e=>{const m=JSON.parse(e.data);if(m.event==='state')window.__testState=m.state;});}};});
-  const failedAssets=[];page.on('response',r=>{if(r.status()>=400)failedAssets.push(`${r.status()} ${r.url()}`);});
-  await page.goto(f.url);await page.getByLabel('玩家名称').fill('orb_ui');await page.getByLabel('密码',{exact:true}).fill('testpw');
-  await page.getByRole('button',{name:'连接银河'}).click();await page.getByRole('button',{name:'创建游戏',exact:false}).click();
-  await page.locator('#room-name').fill('Orb map UI');
-  await page.locator('[data-config="expansion"][value="4"]').check();
-  await page.locator('[data-config="orb"]').check();
-  await page.locator('#create-form button[type="submit"]').click();await page.getByRole('heading',{name:'Orb map UI',exact:true}).waitFor();
-  const bob=await new Peer(f.wsUrl).login('orb_bob'),id=await page.evaluate(()=>window.__testState.roomId);await bob.wait(s=>s.rooms[id]);bob.send({action:'join',id});await bob.wait(s=>s.status==='room');t.after(()=>bob.close());
-  const seen=new Set();
-  bob.onState=s=>{const q=s.choice;if(!q||s.status!=='playing'||seen.has(q.pos))return;const answer=autoPlayerAnswer(s,catalog);assert.equal(validateChoice(s,answer,catalog),null);seen.add(q.pos);bob.send({action:'choice',...answer});};
-  await page.getByRole('button',{name:'开始远征'}).click();
-  const advanceUntil=async type=>{
-    const end=Date.now()+30000;
-    while(Date.now()<end){
-      const current=await page.evaluate(()=>window.__testState);
-      if(current?.choice?.type===type)return current;
-      if(!current?.choice){await page.waitForTimeout(30);continue;}
-      const model=describeChoice(current,catalog),answer=autoPlayerAnswer(current,catalog);
-      assert.equal(validateChoice(current,answer,catalog),null,'Orb setup answer is legal');
-      await clickAnswer(page,current,model,answer);
-      const pos=current.choice.pos;
-      await page.waitForFunction(old=>!window.__testState.choice||window.__testState.choice.pos!==old,pos,{timeout:15000});
-    }
-    throw new Error(`Timed out waiting for Orb choice type ${type}`);
-  };
-
-  const placementState=await advanceUntil(39);
-  const placementUi=describeChoice(placementState,catalog);
-  assert.equal(await page.locator('.choice-option').count(),0,'placement is not a long coordinate-button list');
-  assert.equal(await page.locator('.game-details .orb-map').count(),0,'the permanent board does not duplicate the placement map');
-  assert.ok(await page.locator('.orb-placement-target').count()>0,'placement anchors are shown on the map');
-  assert.ok(await page.locator('.orb-placement-target').count()<placementState.choice.list.length,'rotations are grouped by map anchor');
-  const placementsByPosition=new Map();
-  for(const option of placementUi.options){const key=`${option.x},${option.y}`;if(!placementsByPosition.has(key))placementsByPosition.set(key,[]);placementsByPosition.get(key).push(option);}
-  const rotationGroup=[...placementsByPosition.values()].find(group=>group.length>1);assert.ok(rotationGroup,'at least one map anchor has multiple legal rotations');
-  await page.locator(`.orb-placement-target[data-key="${rotationGroup[0].key}"]`).click();
-  assert.equal(await page.locator('.orb-target.selected').count(),1,'placement anchor selection is visible');
-  assert.equal(await page.locator('.orb-placement-preview .orb-placement-art').count(),1,'selected card preview is drawn on the map');
-  const rotation=page.locator('[data-action="rotate-placement"]');assert.ok(await rotation.isEnabled(),'legal rotations use a rotate control');
-  const beforeRotation=await page.locator('.placement-status').textContent();await rotation.click();assert.notEqual(await page.locator('.placement-status').textContent(),beforeRotation,'rotation changes the pending placement');
-  assert.ok(await page.locator('[data-action="confirm"]').isEnabled(),'map placement can be confirmed');
-  await page.screenshot({path:path.join(root,'test-results/orb-placement-map-mobile.png')});
-  const placementPos=await page.evaluate(()=>window.__testState.choice.pos);
-  await page.locator('[data-action="confirm"]').click();
-  await page.waitForFunction(old=>!window.__testState.choice||window.__testState.choice.pos!==old,placementPos,{timeout:15000});
-
-  const mapState=await advanceUntil(40);
-  const model=mapState.choice;
-  const map=page.locator('.choice-panel .orb-map');
-  await map.waitFor();
-  assert.equal(await page.locator('.choice-panel .orb-map').count(),1,'the active map is shown once');
-  assert.equal(await page.locator('.game-details .orb-map').count(),0,'the permanent board does not duplicate the active map');
-  assert.equal(await page.locator('.orb-target').count(),model.list.length,'every legal map cell is directly clickable');
-  assert.ok(await page.locator('.orb-component').count()>=2,'both Main Airlock art components are visible');
-  const artwork=await page.locator('.orb-component').evaluateAll(es=>[...new Set(es.map(e=>e.getAttribute('href')))]);
-  assert.ok(artwork.some(href=>href.includes('/airlocks/airlock_main_')),'Main Airlock artwork is used');
-  for(const href of artwork)assert.equal((await page.request.get(f.url+href)).ok(),true,`Orb artwork loads: ${href}`);
-  const overflow=await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth||document.querySelector('.orb-map-wrap').scrollWidth>document.querySelector('.orb-map-wrap').clientWidth+1);
-  assert.equal(overflow,false,'Orb map has no page or container overflow');
-  await page.locator('.orb-target').first().click();
-  assert.equal(await page.locator('.orb-target.selected').count(),1,'map click selects the destination');
-  assert.ok(await page.locator('[data-action="confirm"]').isEnabled(),'map selection can be confirmed');
-  await page.screenshot({path:path.join(root,'test-results/orb-map-direct-mobile.png')});
-  assert.deepEqual(failedAssets,[]);
 });
 
 async function checkDisplaySettings(page){
